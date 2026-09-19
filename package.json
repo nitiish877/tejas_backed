@@ -8,13 +8,14 @@
     "start": "tsx server.ts",
     "build": "echo 'No compile step needed with tsx runtime'"
   },
-  "dependencies": {
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+  "engines": {
+    "node": ">=18"
   },
-  "devDependencies": {
+  "dependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.17.10",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "tsx": "^4.19.2",
     "typescript": "^5.5.3"
   }
