@@ -19,6 +19,24 @@ const authLimiter = rateLimit({
   message: { error: 'Bahut zyada attempts. Thodi der baad try karo.' },
 });
 
+// Guest/temp chat save: bina login ke khula endpoint hai, isliye DB flood se bachne ke liye limit
+const ephemeralLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Bahut zyada requests. Thodi der baad try karo.' },
+});
+
+// Public share link padhne pe limit (scraping / abuse se bachne ke liye)
+const shareReadLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Bahut zyada requests. Thodi der baad try karo.' },
+});
+
 // DB ya JWT_SECRET na ho to saaf message do (crash nahi)
 function requireConfigured(_req: Request, res: Response, next: NextFunction) {
   if (!dbEnabled || !pool) {
@@ -65,8 +83,8 @@ function resolveEphemeralOwner(req: Request): { ownerType: 'user' | 'guest'; own
       // invalid/expired token: guest id se fallback karo neeche
     }
   }
-  const guestId = String(req.headers['x-guest-id'] || '').trim().slice(0, 100);
-  if (guestId) return { ownerType: 'guest', ownerId: guestId };
+  const guestId = String(req.headers['x-guest-id'] || '').trim();
+  if (/^guest_[a-z0-9]{6,80}$/.test(guestId)) return { ownerType: 'guest', ownerId: guestId };
   return null;
 }
 
@@ -203,7 +221,10 @@ router.put('/chats/:id', requireConfigured, requireAuth, async (req: Request, re
 
 router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
-    await pool!.query('DELETE FROM chats WHERE id = $1 AND user_id = $2', [String(req.params.id), res.locals.userId]);
+    const chatId = String(req.params.id);
+    await pool!.query('DELETE FROM chats WHERE id = $1 AND user_id = $2', [chatId, res.locals.userId]);
+    // Chat delete ho gayi to uska public share link bhi band
+    await pool!.query('DELETE FROM shares WHERE chat_id = $1 AND owner_id = $2', [chatId, res.locals.userId]);
     res.json({ ok: true });
   } catch (err) {
     console.error('delete chat error:', err);
@@ -214,7 +235,7 @@ router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request,
 // ---------------- EPHEMERAL (GUEST / TEMP) CHATS ----------------
 // Ye chats kabhi UI me wapas nahi laayi jaatin. Sirf 30 din ke liye DB me
 // safety-net ke taur par rakhi jaati hain, phir apne aap delete ho jaati hain.
-router.put('/ephemeral/chats/:id', requireConfigured, async (req: Request, res: Response) => {
+router.put('/ephemeral/chats/:id', requireConfigured, ephemeralLimiter, async (req: Request, res: Response) => {
   try {
     const owner = resolveEphemeralOwner(req);
     if (!owner) return res.status(400).json({ error: 'Guest id ya login chahiye.' });
@@ -229,6 +250,19 @@ router.put('/ephemeral/chats/:id', requireConfigured, async (req: Request, res: 
     const updatedAt = Number(b.updatedAt) || Date.now();
     const isTemp = Boolean(b.isTemp);
     const expiresAt = createdAt + THIRTY_DAYS_MS;
+
+    // Ek owner ki max 100 safety-net chats (bot DB bhar na sake)
+    const known = await pool!.query(
+      'SELECT 1 FROM ephemeral_chats WHERE id = $1 AND owner_type = $2 AND owner_id = $3',
+      [id, owner.ownerType, owner.ownerId]
+    );
+    if (!known.rowCount) {
+      const cnt = await pool!.query(
+        'SELECT count(*)::int AS n FROM ephemeral_chats WHERE owner_type = $1 AND owner_id = $2',
+        [owner.ownerType, owner.ownerId]
+      );
+      if (cnt.rows[0].n >= 100) return res.status(429).json({ error: 'Limit poori ho gayi.' });
+    }
 
     await pool!.query(
       `INSERT INTO ephemeral_chats (id, owner_type, owner_id, is_temp, title, created_at, updated_at, expires_at, messages)
@@ -249,7 +283,7 @@ router.put('/ephemeral/chats/:id', requireConfigured, async (req: Request, res: 
 
 // Guest login/register karke apna account bana le to us guest_id ki non-temp
 // safety-net copies hata do (asli chats ab uske account me `chats` table me migrate ho chuki hain).
-router.delete('/ephemeral/guest/:guestId', requireConfigured, async (req: Request, res: Response) => {
+router.delete('/ephemeral/guest/:guestId', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const guestId = String(req.params.guestId).slice(0, 100);
     await pool!.query(
@@ -278,11 +312,35 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
     const userResult = await pool!.query('SELECT name FROM users WHERE id = $1', [res.locals.userId]);
     const ownerName = userResult.rows[0]?.name || 'Tejas AI user';
 
+    // Public snapshot me sirf ye fields jayengi (koi internal field leak nahi hogi)
+    const safeMessages = (Array.isArray(chat.messages) ? chat.messages : [])
+      .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant'))
+      .map((m: any) => ({
+        id: String(m.id || '').slice(0, 100),
+        role: m.role,
+        content: String(m.content || '').slice(0, 100000),
+        timestamp: Number(m.timestamp) || Date.now(),
+      }));
+
+    // Us chat ka link pehle se hai to wahi rakho aur snapshot naya kar do (har click pe naya link nahi)
+    const existing = await pool!.query(
+      'SELECT share_id FROM shares WHERE chat_id = $1 AND owner_id = $2 ORDER BY created_at DESC LIMIT 1',
+      [chatId, res.locals.userId]
+    );
+    if (existing.rows[0]) {
+      const shareId = existing.rows[0].share_id;
+      await pool!.query(
+        'UPDATE shares SET title = $1, messages = $2::jsonb, owner_name = $3 WHERE share_id = $4',
+        [chat.title, JSON.stringify(safeMessages), ownerName, shareId]
+      );
+      return res.json({ shareId });
+    }
+
     const shareId = randomUUID().replace(/-/g, '').slice(0, 16);
     await pool!.query(
       `INSERT INTO shares (share_id, chat_id, owner_id, owner_name, title, messages, created_at)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
-      [shareId, chatId, res.locals.userId, ownerName, chat.title, JSON.stringify(chat.messages), Date.now()]
+      [shareId, chatId, res.locals.userId, ownerName, chat.title, JSON.stringify(safeMessages), Date.now()]
     );
     res.status(201).json({ shareId });
   } catch (err) {
@@ -292,8 +350,10 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
 });
 
 // Public read: login ho ya na ho, koi bhi shared chat padh sakta hai.
-router.get('/share/:shareId', requireConfigured, async (req: Request, res: Response) => {
+router.get('/share/:shareId', requireConfigured, shareReadLimiter, async (req: Request, res: Response) => {
   try {
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    res.setHeader('Cache-Control', 'no-store');
     const shareId = String(req.params.shareId).slice(0, 64);
     const result = await pool!.query(
       'SELECT title, messages, owner_name, created_at FROM shares WHERE share_id = $1',
