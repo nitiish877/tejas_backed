@@ -52,8 +52,20 @@ function signToken(userId: string): string {
   return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
-function publicUser(row: { id: string; name: string; email: string }) {
-  return { id: row.id, name: row.name, email: row.email, provider: 'email' as const };
+function publicUser(row: any) {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    provider: 'email' as const,
+    // Subscription fields (default to free if missing)
+    subscriptionPlan: row.subscription_plan || 'free',
+    ownedPlans: Array.isArray(row.owned_plans) ? row.owned_plans : [],
+    planExpiries: row.plan_expiries && typeof row.plan_expiries === 'object' ? row.plan_expiries : {},
+    subscriptionStartedAt: row.subscription_started_at ? Number(row.subscription_started_at) : undefined,
+    subscriptionExpiresAt: row.subscription_expires_at ? Number(row.subscription_expires_at) : undefined,
+    lastPaymentId: row.last_payment_id || undefined,
+  };
 }
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -114,7 +126,15 @@ router.post('/auth/register', requireConfigured, authLimiter, async (req: Reques
       hash,
     ]);
 
-    res.status(201).json({ token: signToken(id), user: publicUser({ id, name: displayName, email }) });
+    // Fetch the freshly inserted row so publicUser() gets all the subscription defaults
+    const fresh = await pool!.query(
+      `SELECT id, name, email, subscription_plan, owned_plans, plan_expiries,
+              subscription_started_at, subscription_expires_at, last_payment_id
+       FROM users WHERE id = $1`,
+      [id]
+    );
+
+    res.status(201).json({ token: signToken(id), user: publicUser(fresh.rows[0]) });
   } catch (err: any) {
     // do requests ek saath aayein to UNIQUE constraint yahan pakdegi
     if (err?.code === '23505') return res.status(409).json({ error: 'Is email se account pehle se hai. Sign In karo.' });
@@ -129,7 +149,12 @@ router.post('/auth/login', requireConfigured, authLimiter, async (req: Request, 
     const password = String(req.body?.password || '');
     if (!email || !password) return res.status(400).json({ error: 'Email aur password daalo.' });
 
-    const result = await pool!.query('SELECT id, name, email, password_hash FROM users WHERE email = $1', [email]);
+    const result = await pool!.query(
+      `SELECT id, name, email, password_hash, subscription_plan, owned_plans, plan_expiries,
+              subscription_started_at, subscription_expires_at, last_payment_id
+       FROM users WHERE email = $1`,
+      [email]
+    );
     const row = result.rows[0];
     // Email galat ho ya password, dono me same message (kaun sa galat hai ye leak na ho)
     const ok = row ? await bcrypt.compare(password, row.password_hash) : false;
@@ -144,7 +169,12 @@ router.post('/auth/login', requireConfigured, authLimiter, async (req: Request, 
 
 router.get('/auth/me', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
   try {
-    const result = await pool!.query('SELECT id, name, email FROM users WHERE id = $1', [res.locals.userId]);
+    const result = await pool!.query(
+      `SELECT id, name, email, subscription_plan, owned_plans, plan_expiries,
+              subscription_started_at, subscription_expires_at, last_payment_id
+       FROM users WHERE id = $1`,
+      [res.locals.userId]
+    );
     if (!result.rows[0]) return res.status(401).json({ error: 'Account not found' });
     res.json({ user: publicUser(result.rows[0]) });
   } catch (err) {
@@ -158,12 +188,58 @@ router.put('/auth/me', requireConfigured, requireAuth, async (req: Request, res:
     const name = String(req.body?.name || '').trim().slice(0, 60);
     if (!name) return res.status(400).json({ error: 'Name khali nahi ho sakta.' });
     const result = await pool!.query(
-      'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name, email',
+      `UPDATE users SET name = $1 WHERE id = $2
+       RETURNING id, name, email, subscription_plan, owned_plans, plan_expiries,
+                 subscription_started_at, subscription_expires_at, last_payment_id`,
       [name, res.locals.userId]
     );
     res.json({ user: publicUser(result.rows[0]) });
   } catch (err) {
     console.error('update name error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Save the user's subscription state after a payment (or after expiry auto-cleanup).
+router.put('/auth/subscription', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const b = req.body || {};
+
+    const subscriptionPlan = typeof b.subscriptionPlan === 'string' ? b.subscriptionPlan.slice(0, 20) : 'free';
+    const ownedPlans = Array.isArray(b.ownedPlans)
+      ? b.ownedPlans.filter((p: any) => typeof p === 'string').slice(0, 10)
+      : [];
+    const planExpiries = b.planExpiries && typeof b.planExpiries === 'object' ? b.planExpiries : {};
+    const subscriptionStartedAt = Number(b.subscriptionStartedAt) || null;
+    const subscriptionExpiresAt = Number(b.subscriptionExpiresAt) || null;
+    const lastPaymentId = typeof b.lastPaymentId === 'string' ? b.lastPaymentId.slice(0, 100) : null;
+
+    const result = await pool!.query(
+      `UPDATE users SET
+         subscription_plan = $1,
+         owned_plans = $2::jsonb,
+         plan_expiries = $3::jsonb,
+         subscription_started_at = $4,
+         subscription_expires_at = $5,
+         last_payment_id = $6
+       WHERE id = $7
+       RETURNING id, name, email, subscription_plan, owned_plans, plan_expiries,
+                 subscription_started_at, subscription_expires_at, last_payment_id`,
+      [
+        subscriptionPlan,
+        JSON.stringify(ownedPlans),
+        JSON.stringify(planExpiries),
+        subscriptionStartedAt,
+        subscriptionExpiresAt,
+        lastPaymentId,
+        res.locals.userId,
+      ]
+    );
+
+    if (!result.rows[0]) return res.status(401).json({ error: 'Account not found' });
+    res.json({ user: publicUser(result.rows[0]) });
+  } catch (err) {
+    console.error('save subscription error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -386,5 +462,118 @@ router.delete('/share/:shareId', requireConfigured, requireAuth, async (req: Req
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ---------------- PAYMENTS ----------------
+// Save a payment record after a successful subscription purchase.
+router.post('/payments', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const b = req.body || {};
+    const id = randomUUID();
+    await pool!.query(
+      `INSERT INTO payments
+         (id, user_id, plan, model_id, plan_name, amount, period, duration_days,
+          payment_method, utr_number, tx_id, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        id,
+        res.locals.userId,
+        String(b.plan || '').slice(0, 20),
+        String(b.modelId || '').slice(0, 100),
+        String(b.planName || '').slice(0, 100),
+        Number(b.amount) || 0,
+        String(b.period || '').slice(0, 30),
+        Number(b.durationDays) || 0,
+        String(b.paymentMethod || 'upi').slice(0, 20),
+        b.utrNumber ? String(b.utrNumber).slice(0, 100) : null,
+        String(b.txId || '').slice(0, 100),
+        Number(b.createdAt) || Date.now(),
+      ]
+    );
+    res.status(201).json({ ok: true, id });
+  } catch (err) {
+    console.error('save payment error:', err);
+    res.status(500).json({ error: 'Payment save nahi ho paya.' });
+  }
+});
 
+// List the logged-in user's payment history.
+router.get('/payments', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const result = await pool!.query(
+      `SELECT id, plan, model_id, plan_name, amount, period, duration_days,
+              payment_method, utr_number, tx_id, created_at
+       FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`,
+      [res.locals.userId]
+    );
+    const payments = result.rows.map((r) => ({
+      id: r.id,
+      plan: r.plan,
+      modelId: r.model_id,
+      planName: r.plan_name,
+      amount: Number(r.amount),
+      period: r.period,
+      durationDays: Number(r.duration_days),
+      paymentMethod: r.payment_method,
+      utrNumber: r.utr_number || undefined,
+      txId: r.tx_id,
+      createdAt: Number(r.created_at),
+    }));
+    res.json({ payments });
+  } catch (err) {
+    console.error('list payments error:', err);
+    res.status(500).json({ error: 'Payment history load nahi ho payi.' });
+  }
+});
+
+// Single payment record (for the detail view / receipt).
+router.get('/payments/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const result = await pool!.query(
+      `SELECT id, plan, model_id, plan_name, amount, period, duration_days,
+              payment_method, utr_number, tx_id, created_at
+       FROM payments WHERE id = $1 AND user_id = $2`,
+      [String(req.params.id).slice(0, 100), res.locals.userId]
+    );
+    const r = result.rows[0];
+    if (!r) return res.status(404).json({ error: 'Payment not found.' });
+    res.json({
+      payment: {
+        id: r.id,
+        plan: r.plan,
+        modelId: r.model_id,
+        planName: r.plan_name,
+        amount: Number(r.amount),
+        period: r.period,
+        durationDays: Number(r.duration_days),
+        paymentMethod: r.payment_method,
+        utrNumber: r.utr_number || undefined,
+        txId: r.tx_id,
+        createdAt: Number(r.created_at),
+      },
+    });
+  } catch (err) {
+    console.error('get payment error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---------------- SHARES (list user's own shares) ----------------
+router.get('/shares', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const result = await pool!.query(
+      `SELECT share_id, chat_id, title, created_at
+       FROM shares WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 200`,
+      [res.locals.userId]
+    );
+    const shares = result.rows.map((r) => ({
+      shareId: r.share_id,
+      chatId: r.chat_id,
+      title: r.title,
+      createdAt: Number(r.created_at),
+    }));
+    res.json({ shares });
+  } catch (err) {
+    console.error('list shares error:', err);
+    res.status(500).json({ error: 'Share list load nahi ho payi.' });
+  }
+});
 export default router;

@@ -35,6 +35,17 @@ export async function initDb(): Promise<void> {
     );
   `);
 
+  // Subscription fields on users (added later, so use ALTER ... IF NOT EXISTS for existing DBs)
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS subscription_plan TEXT DEFAULT 'free',
+      ADD COLUMN IF NOT EXISTS owned_plans JSONB DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS plan_expiries JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS subscription_started_at BIGINT,
+      ADD COLUMN IF NOT EXISTS subscription_expires_at BIGINT,
+      ADD COLUMN IF NOT EXISTS last_payment_id TEXT;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chats (
       id         TEXT NOT NULL,
@@ -83,7 +94,26 @@ export async function initDb(): Promise<void> {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS shares_owner_idx ON shares (owner_id);`);
 
-  console.log('Database ready (users, chats, ephemeral_chats, shares tables).');
+  // Payment history: ek record per successful subscription purchase.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id             TEXT PRIMARY KEY,
+      user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      plan           TEXT NOT NULL,
+      model_id       TEXT NOT NULL,
+      plan_name      TEXT NOT NULL,
+      amount         INTEGER NOT NULL,
+      period         TEXT NOT NULL,
+      duration_days  INTEGER NOT NULL,
+      payment_method TEXT NOT NULL,
+      utr_number     TEXT,
+      tx_id          TEXT NOT NULL,
+      created_at     BIGINT NOT NULL
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS payments_user_idx ON payments (user_id, created_at DESC);`);
+
+  console.log('Database ready (users, chats, ephemeral_chats, shares, payments tables).');
 }
 
 // 30 din se purani guest/temp chats hamesha ke liye delete kar do (auto-cleanup).
