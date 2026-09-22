@@ -10,7 +10,6 @@ const router = Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Brute-force se bachne ke liye: ek IP se 15 min me max 30 login/register try
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
@@ -19,7 +18,6 @@ const authLimiter = rateLimit({
   message: { error: 'Bahut zyada attempts. Thodi der baad try karo.' },
 });
 
-// Guest/temp chat save: bina login ke khula endpoint hai, isliye DB flood se bachne ke liye limit
 const ephemeralLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -28,7 +26,6 @@ const ephemeralLimiter = rateLimit({
   message: { error: 'Bahut zyada requests. Thodi der baad try karo.' },
 });
 
-// Public share link padhne pe limit (scraping / abuse se bachne ke liye)
 const shareReadLimiter = rateLimit({
   windowMs: 5 * 60 * 1000,
   max: 120,
@@ -37,7 +34,6 @@ const shareReadLimiter = rateLimit({
   message: { error: 'Bahut zyada requests. Thodi der baad try karo.' },
 });
 
-// DB ya JWT_SECRET na ho to saaf message do (crash nahi)
 function requireConfigured(_req: Request, res: Response, next: NextFunction) {
   if (!dbEnabled || !pool) {
     return res.status(503).json({ error: 'Account system abhi setup nahi hai (DATABASE_URL missing).' });
@@ -58,7 +54,6 @@ function publicUser(row: any) {
     name: row.name,
     email: row.email,
     provider: 'email' as const,
-    // Subscription fields (default to free if missing)
     subscriptionPlan: row.subscription_plan || 'free',
     ownedPlans: Array.isArray(row.owned_plans) ? row.owned_plans : [],
     planExpiries: row.plan_expiries && typeof row.plan_expiries === 'object' ? row.plan_expiries : {},
@@ -82,8 +77,6 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   }
 }
 
-// Ephemeral (guest/temp) chats ke liye: JWT mile to logged-in user ke naam se,
-// warna X-Guest-Id header se anonymous guest ke naam se save hota hai. Login zaroori nahi.
 function resolveEphemeralOwner(req: Request): { ownerType: 'user' | 'guest'; ownerId: string } | null {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
@@ -126,7 +119,6 @@ router.post('/auth/register', requireConfigured, authLimiter, async (req: Reques
       hash,
     ]);
 
-    // Fetch the freshly inserted row so publicUser() gets all the subscription defaults
     const fresh = await pool!.query(
       `SELECT id, name, email, subscription_plan, owned_plans, plan_expiries,
               subscription_started_at, subscription_expires_at, last_payment_id
@@ -136,7 +128,6 @@ router.post('/auth/register', requireConfigured, authLimiter, async (req: Reques
 
     res.status(201).json({ token: signToken(id), user: publicUser(fresh.rows[0]) });
   } catch (err: any) {
-    // do requests ek saath aayein to UNIQUE constraint yahan pakdegi
     if (err?.code === '23505') return res.status(409).json({ error: 'Is email se account pehle se hai. Sign In karo.' });
     console.error('register error:', err);
     res.status(500).json({ error: 'Register nahi ho paya. Thodi der baad try karo.' });
@@ -156,7 +147,6 @@ router.post('/auth/login', requireConfigured, authLimiter, async (req: Request, 
       [email]
     );
     const row = result.rows[0];
-    // Email galat ho ya password, dono me same message (kaun sa galat hai ye leak na ho)
     const ok = row ? await bcrypt.compare(password, row.password_hash) : false;
     if (!ok) return res.status(401).json({ error: 'Email ya password galat hai.' });
 
@@ -200,7 +190,6 @@ router.put('/auth/me', requireConfigured, requireAuth, async (req: Request, res:
   }
 });
 
-// Save the user's subscription state after a payment (or after expiry auto-cleanup).
 router.put('/auth/subscription', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
@@ -299,7 +288,6 @@ router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request,
   try {
     const chatId = String(req.params.id);
     await pool!.query('DELETE FROM chats WHERE id = $1 AND user_id = $2', [chatId, res.locals.userId]);
-    // Chat delete ho gayi to uska public share link bhi band
     await pool!.query('DELETE FROM shares WHERE chat_id = $1 AND owner_id = $2', [chatId, res.locals.userId]);
     res.json({ ok: true });
   } catch (err) {
@@ -308,9 +296,7 @@ router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request,
   }
 });
 
-// ---------------- EPHEMERAL (GUEST / TEMP) CHATS ----------------
-// Ye chats kabhi UI me wapas nahi laayi jaatin. Sirf 30 din ke liye DB me
-// safety-net ke taur par rakhi jaati hain, phir apne aap delete ho jaati hain.
+// ---------------- EPHEMERAL ----------------
 router.put('/ephemeral/chats/:id', requireConfigured, ephemeralLimiter, async (req: Request, res: Response) => {
   try {
     const owner = resolveEphemeralOwner(req);
@@ -327,7 +313,6 @@ router.put('/ephemeral/chats/:id', requireConfigured, ephemeralLimiter, async (r
     const isTemp = Boolean(b.isTemp);
     const expiresAt = createdAt + THIRTY_DAYS_MS;
 
-    // Ek owner ki max 100 safety-net chats (bot DB bhar na sake)
     const known = await pool!.query(
       'SELECT 1 FROM ephemeral_chats WHERE id = $1 AND owner_type = $2 AND owner_id = $3',
       [id, owner.ownerType, owner.ownerId]
@@ -357,8 +342,6 @@ router.put('/ephemeral/chats/:id', requireConfigured, ephemeralLimiter, async (r
   }
 });
 
-// Guest login/register karke apna account bana le to us guest_id ki non-temp
-// safety-net copies hata do (asli chats ab uske account me `chats` table me migrate ho chuki hain).
 router.delete('/ephemeral/guest/:guestId', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const guestId = String(req.params.guestId).slice(0, 100);
@@ -374,7 +357,6 @@ router.delete('/ephemeral/guest/:guestId', requireConfigured, requireAuth, async
 });
 
 // ---------------- SHARE ----------------
-// Chat ka ek read-only public snapshot banao. Sirf logged-in user hi share bana sakta hai.
 router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const chatId = String(req.params.chatId).slice(0, 100);
@@ -388,7 +370,6 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
     const userResult = await pool!.query('SELECT name FROM users WHERE id = $1', [res.locals.userId]);
     const ownerName = userResult.rows[0]?.name || 'Tejas AI user';
 
-    // Public snapshot me sirf ye fields jayengi (koi internal field leak nahi hogi)
     const safeMessages = (Array.isArray(chat.messages) ? chat.messages : [])
       .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant'))
       .map((m: any) => ({
@@ -398,7 +379,6 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
         timestamp: Number(m.timestamp) || Date.now(),
       }));
 
-    // Us chat ka link pehle se hai to wahi rakho aur snapshot naya kar do (har click pe naya link nahi)
     const existing = await pool!.query(
       'SELECT share_id FROM shares WHERE chat_id = $1 AND owner_id = $2 ORDER BY created_at DESC LIMIT 1',
       [chatId, res.locals.userId]
@@ -425,7 +405,6 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
   }
 });
 
-// Public read: login ho ya na ho, koi bhi shared chat padh sakta hai.
 router.get('/share/:shareId', requireConfigured, shareReadLimiter, async (req: Request, res: Response) => {
   try {
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
@@ -449,7 +428,6 @@ router.get('/share/:shareId', requireConfigured, shareReadLimiter, async (req: R
   }
 });
 
-// Apna share link wapas hatao (revoke) — sirf jisne banaya wahi hata sakta hai.
 router.delete('/share/:shareId', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     await pool!.query('DELETE FROM shares WHERE share_id = $1 AND owner_id = $2', [
@@ -464,7 +442,6 @@ router.delete('/share/:shareId', requireConfigured, requireAuth, async (req: Req
 });
 
 // ---------------- PAYMENTS ----------------
-// Save a payment record after a successful subscription purchase.
 router.post('/payments', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const b = req.body || {};
@@ -496,7 +473,6 @@ router.post('/payments', requireConfigured, requireAuth, async (req: Request, re
   }
 });
 
-// List the logged-in user's payment history.
 router.get('/payments', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
   try {
     const result = await pool!.query(
@@ -525,7 +501,6 @@ router.get('/payments', requireConfigured, requireAuth, async (_req: Request, re
   }
 });
 
-// Single payment record (for the detail view / receipt).
 router.get('/payments/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const result = await pool!.query(
@@ -557,7 +532,7 @@ router.get('/payments/:id', requireConfigured, requireAuth, async (req: Request,
   }
 });
 
-// ---------------- SHARES (list user's own shares) ----------------
+// ---------------- SHARES (list user's own) ----------------
 router.get('/shares', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
   try {
     const result = await pool!.query(
