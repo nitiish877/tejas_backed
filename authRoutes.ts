@@ -462,6 +462,7 @@ router.delete('/share/:shareId', requireConfigured, requireAuth, async (req: Req
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 // ---------------- PAYMENTS ----------------
 // Save a payment record after a successful subscription purchase.
 router.post('/payments', requireConfigured, requireAuth, async (req: Request, res: Response) => {
@@ -576,4 +577,5 @@ router.get('/shares', requireConfigured, requireAuth, async (_req: Request, res:
     res.status(500).json({ error: 'Share list load nahi ho payi.' });
   }
 });
+
 export default router;
