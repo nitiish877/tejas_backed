@@ -46,6 +46,20 @@ export async function initDb(): Promise<void> {
       ADD COLUMN IF NOT EXISTS last_payment_id TEXT;
   `);
 
+  // OAuth / Firebase fields. Firebase Google users have no password (password_hash NULL).
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'email',
+      ADD COLUMN IF NOT EXISTS provider_id TEXT,
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+  `);
+  await pool.query(`ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_provider_idx
+      ON users (provider, provider_id)
+      WHERE provider_id IS NOT NULL;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chats (
       id         TEXT NOT NULL,

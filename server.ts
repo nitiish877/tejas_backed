@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import { initDb, purgeExpiredEphemeralChats } from './db';
 import authRoutes from './authRoutes';
+import './firebaseAdmin';
 
 dotenv.config();
 
