@@ -21,7 +21,9 @@
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "compression": "^1.7.5",
+    "@types/compression": "^1.7.5"
   },
   "engines": {
     "node": ">=18"

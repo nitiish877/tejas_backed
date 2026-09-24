@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'crypto';
 import { pool, dbEnabled } from './db';
 import { firebaseAuth, firebaseAdminEnabled } from './firebaseAdmin';
+import compression from 'compression';
 
 const JWT_SECRET = (process.env.JWT_SECRET || '').trim();
 const router = Router();
@@ -323,12 +324,15 @@ router.put('/auth/subscription', requireConfigured, requireAuth, async (req: Req
 });
 
 // ---------------- CHATS ----------------
-router.get('/chats', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
+// Fast chat LIST — sends only metadata (no messages). Messages load on demand.
+router.get('/chats', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
+    const limit = Math.min(Number(req.query.limit) || 60, 200);
     const result = await pool!.query(
-      `SELECT id, title, is_pinned, created_at, updated_at, messages
-       FROM chats WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 500`,
-      [res.locals.userId]
+      `SELECT id, title, is_pinned, created_at, updated_at,
+              jsonb_array_length(messages) AS message_count
+       FROM chats WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+      [res.locals.userId, limit]
     );
     const chats = result.rows.map((r) => ({
       id: r.id,
@@ -336,12 +340,39 @@ router.get('/chats', requireConfigured, requireAuth, async (_req: Request, res: 
       isPinned: r.is_pinned,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
-      messages: r.messages,
+      messageCount: Number(r.message_count) || 0,
+      messages: [], // Messages are fetched separately when the chat is opened
     }));
     res.json({ chats });
   } catch (err) {
     console.error('list chats error:', err);
     res.status(500).json({ error: 'Chats load nahi ho paye.' });
+  }
+});
+
+// Single chat with full messages — called only when the user opens a chat.
+router.get('/chats/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const result = await pool!.query(
+      `SELECT id, title, is_pinned, created_at, updated_at, messages
+       FROM chats WHERE id = $1 AND user_id = $2`,
+      [String(req.params.id).slice(0, 100), res.locals.userId]
+    );
+    const r = result.rows[0];
+    if (!r) return res.status(404).json({ error: 'Chat not found' });
+    res.json({
+      chat: {
+        id: r.id,
+        title: r.title,
+        isPinned: r.is_pinned,
+        createdAt: Number(r.created_at),
+        updatedAt: Number(r.updated_at),
+        messages: r.messages,
+      },
+    });
+  } catch (err) {
+    console.error('get chat error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 

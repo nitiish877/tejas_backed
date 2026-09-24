@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import compression from 'compression';
 import dotenv from 'dotenv';
 import { initDb, purgeExpiredEphemeralChats } from './db';
 import authRoutes from './authRoutes';
@@ -32,6 +33,9 @@ function getCleanToken(tokenCandidate?: string): string {
   return token;
 }
 
+// Gzip compression — JSON responses 80% chhoti ho jaati hain
+app.use(compression());
+
 // Enable CORS for external access (allow Vercel, localhost, Android WebView)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -43,10 +47,10 @@ app.use((req, res, next) => {
   next();
 });
 
-   app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-   // Login / register / chat-sync routes
-   app.use('/api', authRoutes);
+// Login / register / chat-sync / payments / shares / OAuth routes
+app.use('/api', authRoutes);
 
 // API Version & Changelog (Used by frontend to check updates)
 const CURRENT_APP_VERSION = '1.0.1';
@@ -337,21 +341,21 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   }
 });
 
-   initDb()
-     .catch((err) => console.error('Database init failed (guest mode chalta rahega):', err.message))
-     .finally(() => {
-       app.listen(PORT, '0.0.0.0', () => {
-         console.log(`Backend server running on http://0.0.0.0:${PORT}`);
-       });
+initDb()
+  .catch((err) => console.error('Database init failed (guest mode chalta rahega):', err.message))
+  .finally(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Backend server running on http://0.0.0.0:${PORT}`);
+    });
 
-       // 30-din se purani guest/temp chats auto-delete: startup pe ek baar, phir har 6 ghante me.
-       const runCleanup = () => {
-         purgeExpiredEphemeralChats()
-           .then((count) => {
-             if (count > 0) console.log(`Auto-cleanup: ${count} expired guest/temp chat(s) deleted.`);
-           })
-           .catch((err) => console.error('Ephemeral chat cleanup failed:', err.message));
-       };
-       runCleanup();
-       setInterval(runCleanup, 6 * 60 * 60 * 1000);
-     });
+    // 30-din se purani guest/temp chats auto-delete: startup pe ek baar, phir har 6 ghante me.
+    const runCleanup = () => {
+      purgeExpiredEphemeralChats()
+        .then((count) => {
+          if (count > 0) console.log(`Auto-cleanup: ${count} expired guest/temp chat(s) deleted.`);
+        })
+        .catch((err) => console.error('Ephemeral chat cleanup failed:', err.message));
+    };
+    runCleanup();
+    setInterval(runCleanup, 6 * 60 * 60 * 1000);
+  });
