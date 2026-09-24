@@ -241,16 +241,23 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       });
     }
 
+    // Track any error text we read so we never try to read the body twice
+    // (a Response body can only be consumed once — reading twice throws
+    // "Body is unusable").
+    let preReadErrorText: string | null = null;
+
     if (!response.ok && selectedModel !== FALLBACK_MODEL) {
-      const initialError = await response.text();
+      // Read the error body ONCE and keep it for later use
+      preReadErrorText = await response.text();
       const isProviderOrNotFound =
         response.status === 400 ||
         response.status === 404 ||
-        initialError.includes('not supported by any provider') ||
-        initialError.includes('not supported') ||
-        initialError.includes('Model not found');
+        preReadErrorText.includes('not supported by any provider') ||
+        preReadErrorText.includes('not supported') ||
+        preReadErrorText.includes('Model not found');
 
       if (isProviderOrNotFound) {
+        // Retry with fallback model — this gives us a fresh Response whose body is untouched
         selectedModel = FALLBACK_MODEL;
         response = await fetch('https://router.huggingface.co/v1/chat/completions', {
           method: 'POST',
@@ -266,11 +273,13 @@ app.post('/api/chat', async (req: Request, res: Response) => {
             stream: true
           })
         });
+        preReadErrorText = null; // fresh response has its own body
       }
     }
 
     if (!response.ok) {
-      const errorText = await response.text();
+      // Use the error text we already read (if any), otherwise read now
+      const errorText = preReadErrorText ?? (await response.text());
       let parsedMessage = errorText;
       try {
         const errJson = JSON.parse(errorText);
@@ -290,7 +299,6 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       res.end();
       return;
     }
-
     if (!response.body) {
       sendSSE('error', { error: 'No response body stream from provider' });
       res.end();
