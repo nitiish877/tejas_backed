@@ -5,7 +5,6 @@ import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'crypto';
 import { pool, dbEnabled } from './db';
 import { firebaseAuth, firebaseAdminEnabled } from './firebaseAdmin';
-import compression from 'compression';
 
 const JWT_SECRET = (process.env.JWT_SECRET || '').trim();
 const router = Router();
@@ -35,6 +34,9 @@ const shareReadLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Bahut zyada requests. Thodi der baad try karo.' },
 });
+
+const TRASH_RECOVERY_DAYS = 60;
+const TRASH_RECOVERY_MS = TRASH_RECOVERY_DAYS * 24 * 60 * 60 * 1000;
 
 function requireConfigured(_req: Request, res: Response, next: NextFunction) {
   if (!dbEnabled || !pool) {
@@ -87,9 +89,7 @@ function resolveEphemeralOwner(req: Request): { ownerType: 'user' | 'guest'; own
     try {
       const payload = jwt.verify(token, JWT_SECRET) as { sub?: string };
       if (payload.sub) return { ownerType: 'user', ownerId: payload.sub };
-    } catch {
-      // invalid/expired token: guest id se fallback karo neeche
-    }
+    } catch {}
   }
   const guestId = String(req.headers['x-guest-id'] || '').trim();
   if (/^guest_[a-z0-9]{6,80}$/.test(guestId)) return { ownerType: 'guest', ownerId: guestId };
@@ -105,18 +105,13 @@ const USER_SELECT_FIELDS = `id, name, email, provider, avatar_url,
 router.get('/auth/providers', (_req: Request, res: Response) => {
   res.json({
     email: true,
-    // Firebase Admin sirf "Firebase configured hai ya nahi" batata hai.
-    // Actual per-provider availability Firebase Console me decide hoti hai —
-    // agar console me GitHub/Microsoft enable nahi hai to popup error dega.
     google: firebaseAdminEnabled,
     github: firebaseAdminEnabled,
     microsoft: firebaseAdminEnabled,
   });
 });
 
-// ---------------- FIREBASE (Google / GitHub / Microsoft) ----------------
-// Frontend calls this after Firebase popup sign-in with the Firebase ID token.
-// The token tells us which provider was used (google.com / github.com / microsoft.com).
+// ---------------- FIREBASE ----------------
 router.post('/auth/firebase', requireConfigured, authLimiter, async (req: Request, res: Response) => {
   try {
     if (!firebaseAuth) {
@@ -133,12 +128,9 @@ router.post('/auth/firebase', requireConfigured, authLimiter, async (req: Reques
 
     if (!uid || !email) return res.status(400).json({ error: 'Firebase token me email/uid missing hai.' });
 
-    // Extract the real provider from the Firebase token
-    // (google.com → 'google', github.com → 'github', microsoft.com → 'microsoft')
     const rawProvider = String((decoded as any).firebase?.sign_in_provider || 'google');
     const provider = rawProvider.split('.')[0];
 
-    // 1) Find by (provider, provider_id)
     let userRow = (
       await pool!.query(
         `SELECT ${USER_SELECT_FIELDS} FROM users WHERE provider = $1 AND provider_id = $2`,
@@ -146,27 +138,25 @@ router.post('/auth/firebase', requireConfigured, authLimiter, async (req: Reques
       )
     ).rows[0];
 
-    // 2) Fall back to matching by email (link existing email/password account)
     if (!userRow) {
-      const byEmail = await pool!.query('SELECT id FROM users WHERE email = $1', [email]);
+      const byEmail = await pool!.query(
+        `SELECT ${USER_SELECT_FIELDS} FROM users WHERE email = $1`,
+        [email]
+      );
       if (byEmail.rows[0]) {
-        const existingId = byEmail.rows[0].id;
-        await pool!.query(
-          `UPDATE users
-             SET provider = $1,
-                 provider_id = $2,
-                 avatar_url = COALESCE(avatar_url, $3),
-                 name = COALESCE(NULLIF(name, ''), $4)
-           WHERE id = $5`,
-          [provider, uid, picture, name || email.split('@')[0], existingId]
-        );
-        userRow = (
-          await pool!.query(`SELECT ${USER_SELECT_FIELDS} FROM users WHERE id = $1`, [existingId])
-        ).rows[0];
+        const existing = byEmail.rows[0];
+        if ((!existing.name || existing.name === '') && name) {
+          await pool!.query('UPDATE users SET name = $1 WHERE id = $2', [name, existing.id]);
+          existing.name = name;
+        }
+        if (!existing.avatar_url && picture) {
+          await pool!.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [picture, existing.id]);
+          existing.avatar_url = picture;
+        }
+        userRow = existing;
       }
     }
 
-    // 3) Create a brand-new user
     if (!userRow) {
       const newId = randomUUID();
       await pool!.query(
@@ -231,7 +221,6 @@ router.post('/auth/login', requireConfigured, authLimiter, async (req: Request, 
     const row = result.rows[0];
     if (!row) return res.status(401).json({ error: 'Email ya password galat hai.' });
 
-    // OAuth-only users have no password_hash
     if (!row.password_hash) {
       const label =
         row.provider === 'google'
@@ -324,14 +313,16 @@ router.put('/auth/subscription', requireConfigured, requireAuth, async (req: Req
 });
 
 // ---------------- CHATS ----------------
-// Fast chat LIST — sends only metadata (no messages). Messages load on demand.
+// List active chats (metadata only, no messages).
 router.get('/chats', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 60, 200);
     const result = await pool!.query(
       `SELECT id, title, is_pinned, created_at, updated_at,
               jsonb_array_length(messages) AS message_count
-       FROM chats WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+       FROM chats
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY updated_at DESC LIMIT $2`,
       [res.locals.userId, limit]
     );
     const chats = result.rows.map((r) => ({
@@ -341,7 +332,7 @@ router.get('/chats', requireConfigured, requireAuth, async (req: Request, res: R
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
       messageCount: Number(r.message_count) || 0,
-      messages: [], // Messages are fetched separately when the chat is opened
+      messages: [],
     }));
     res.json({ chats });
   } catch (err) {
@@ -350,12 +341,52 @@ router.get('/chats', requireConfigured, requireAuth, async (req: Request, res: R
   }
 });
 
-// Single chat with full messages — called only when the user opens a chat.
+// List trashed chats (metadata only) — 60 din ke andar wale.
+router.get('/chats/trash', requireConfigured, requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const cutoff = Date.now() - TRASH_RECOVERY_MS;
+    const result = await pool!.query(
+      `SELECT id, title, created_at, updated_at, deleted_at,
+              jsonb_array_length(messages) AS message_count
+       FROM chats
+       WHERE user_id = $1
+         AND deleted_at IS NOT NULL
+         AND deleted_at > $2
+       ORDER BY deleted_at DESC LIMIT 200`,
+      [res.locals.userId, cutoff]
+    );
+    const now = Date.now();
+    const chats = result.rows.map((r) => {
+      const deletedAt = Number(r.deleted_at);
+      const expiresAt = deletedAt + TRASH_RECOVERY_MS;
+      const daysLeft = Math.max(0, Math.ceil((expiresAt - now) / (24 * 60 * 60 * 1000)));
+      return {
+        id: r.id,
+        title: r.title,
+        isPinned: false,
+        createdAt: Number(r.created_at),
+        updatedAt: Number(r.updated_at),
+        deletedAt,
+        daysLeft,
+        messageCount: Number(r.message_count) || 0,
+        messages: [],
+      };
+    });
+    res.json({ chats });
+  } catch (err) {
+    console.error('list trash error:', err);
+    res.status(500).json({ error: 'Trash load nahi ho paya.' });
+  }
+});
+
+// Single chat with full messages (called when the user opens it).
+// Refuses to return trashed chats.
 router.get('/chats/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
     const result = await pool!.query(
       `SELECT id, title, is_pinned, created_at, updated_at, messages
-       FROM chats WHERE id = $1 AND user_id = $2`,
+       FROM chats
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
       [String(req.params.id).slice(0, 100), res.locals.userId]
     );
     const r = result.rows[0];
@@ -394,7 +425,8 @@ router.put('/chats/:id', requireConfigured, requireAuth, async (req: Request, re
          title = EXCLUDED.title,
          is_pinned = EXCLUDED.is_pinned,
          updated_at = EXCLUDED.updated_at,
-         messages = EXCLUDED.messages`,
+         messages = EXCLUDED.messages
+       WHERE chats.deleted_at IS NULL`,
       [id, res.locals.userId, title, Boolean(b.isPinned), createdAt, updatedAt, JSON.stringify(b.messages)]
     );
     res.json({ ok: true });
@@ -404,15 +436,68 @@ router.put('/chats/:id', requireConfigured, requireAuth, async (req: Request, re
   }
 });
 
+// DELETE /chats/:id → move to trash. Share link revoked immediately.
 router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
-    const chatId = String(req.params.id);
-    await pool!.query('DELETE FROM chats WHERE id = $1 AND user_id = $2', [chatId, res.locals.userId]);
-    await pool!.query('DELETE FROM shares WHERE chat_id = $1 AND owner_id = $2', [chatId, res.locals.userId]);
+    const chatId = String(req.params.id).slice(0, 100);
+    const now = Date.now();
+    await pool!.query(
+      `UPDATE chats
+         SET deleted_at = $1, is_pinned = FALSE
+       WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`,
+      [now, chatId, res.locals.userId]
+    );
+    await pool!.query('DELETE FROM shares WHERE chat_id = $1 AND owner_id = $2', [
+      chatId,
+      res.locals.userId,
+    ]);
+    res.json({ ok: true, deletedAt: now, recoveryDays: TRASH_RECOVERY_DAYS });
+  } catch (err) {
+    console.error('move to trash error:', err);
+    res.status(500).json({ error: 'Chat Trash me move nahi ho payi.' });
+  }
+});
+
+// Restore a chat from trash (only if still within the 60-day window).
+router.put('/chats/:id/restore', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const chatId = String(req.params.id).slice(0, 100);
+    const cutoff = Date.now() - TRASH_RECOVERY_MS;
+    const result = await pool!.query(
+      `UPDATE chats
+         SET deleted_at = NULL
+       WHERE id = $1 AND user_id = $2
+         AND deleted_at IS NOT NULL
+         AND deleted_at > $3
+       RETURNING id`,
+      [chatId, res.locals.userId, cutoff]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Chat Trash me nahi mili ya 60 din ho gaye.' });
+    }
     res.json({ ok: true });
   } catch (err) {
-    console.error('delete chat error:', err);
-    res.status(500).json({ error: 'Chat delete nahi ho payi.' });
+    console.error('restore chat error:', err);
+    res.status(500).json({ error: 'Chat restore nahi ho payi.' });
+  }
+});
+
+// Permanently delete a chat (from trash) → hard delete from DB immediately.
+router.delete('/chats/:id/permanent', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const chatId = String(req.params.id).slice(0, 100);
+    await pool!.query('DELETE FROM chats WHERE id = $1 AND user_id = $2', [
+      chatId,
+      res.locals.userId,
+    ]);
+    await pool!.query('DELETE FROM shares WHERE chat_id = $1 AND owner_id = $2', [
+      chatId,
+      res.locals.userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('permanent delete error:', err);
+    res.status(500).json({ error: 'Chat permanently delete nahi ho payi.' });
   }
 });
 
@@ -481,7 +566,7 @@ router.post('/share/:chatId', requireConfigured, requireAuth, async (req: Reques
   try {
     const chatId = String(req.params.chatId).slice(0, 100);
     const chatResult = await pool!.query(
-      'SELECT title, messages FROM chats WHERE id = $1 AND user_id = $2',
+      'SELECT title, messages FROM chats WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [chatId, res.locals.userId]
     );
     const chat = chatResult.rows[0];

@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import compression from 'compression';
 import dotenv from 'dotenv';
-import { initDb, purgeExpiredEphemeralChats } from './db';
+import { initDb, purgeExpiredEphemeralChats, purgeOldChats } from './db';
 import authRoutes from './authRoutes';
 import './firebaseAdmin';
 
@@ -356,13 +356,21 @@ initDb()
       console.log(`Backend server running on http://0.0.0.0:${PORT}`);
     });
 
-    // 30-din se purani guest/temp chats auto-delete: startup pe ek baar, phir har 6 ghante me.
+    // Auto-cleanup: startup pe ek baar, phir har 6 ghante me.
+    // - 30+ din purani guest/temp chats → delete
+    // - 60+ din purani trashed chats → hard delete from DB
     const runCleanup = () => {
       purgeExpiredEphemeralChats()
         .then((count) => {
           if (count > 0) console.log(`Auto-cleanup: ${count} expired guest/temp chat(s) deleted.`);
         })
         .catch((err) => console.error('Ephemeral chat cleanup failed:', err.message));
+
+      purgeOldChats()
+        .then((count) => {
+          if (count > 0) console.log(`Auto-cleanup: ${count} old trashed chat(s) hard-deleted.`);
+        })
+        .catch((err) => console.error('Old chats cleanup failed:', err.message));
     };
     runCleanup();
     setInterval(runCleanup, 6 * 60 * 60 * 1000);
