@@ -436,6 +436,86 @@ router.put('/chats/:id', requireConfigured, requireAuth, async (req: Request, re
   }
 });
 
+// POST /chats/:id/append → only APPEND new messages (no need to resend the whole chat).
+// Body: { baseCount, messages: [...new], title?, isPinned?, createdAt?, updatedAt? }
+// baseCount = how many messages the client believes the server has.
+// If the server count doesn't match, returns 409 + serverCount, and the client
+// falls back to a full PUT to resync.
+router.post('/chats/:id/append', requireConfigured, requireAuth, async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id).slice(0, 100);
+    const b = req.body || {};
+    const baseCount = Number(b.baseCount);
+    if (!Number.isInteger(baseCount) || baseCount < 0) {
+      return res.status(400).json({ error: 'baseCount galat hai.' });
+    }
+    if (!Array.isArray(b.messages)) return res.status(400).json({ error: 'messages array chahiye.' });
+    if (b.messages.length > 200) return res.status(400).json({ error: 'Ek baar me bahut zyada messages.' });
+
+    const newMessages = b.messages;
+    const title = String(b.title || 'New chat').slice(0, 200);
+    const isPinned = Boolean(b.isPinned);
+    const createdAt = Number(b.createdAt) || Date.now();
+    const updatedAt = Number(b.updatedAt) || Date.now();
+    const userId = res.locals.userId;
+
+    // Only title/pin changed, no new messages: no count check needed
+    if (newMessages.length === 0) {
+      const meta = await pool!.query(
+        `UPDATE chats SET title = $1, is_pinned = $2, updated_at = GREATEST(updated_at, $3)
+         WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL
+         RETURNING jsonb_array_length(messages) AS n`,
+        [title, isPinned, updatedAt, id, userId]
+      );
+      return res.json({ ok: true, count: meta.rows[0] ? Number(meta.rows[0].n) : 0 });
+    }
+
+    // 1) Chat exists and the server count matches the client's baseCount -> append
+    const upd = await pool!.query(
+      `UPDATE chats
+         SET messages = messages || $1::jsonb,
+             title = $2, is_pinned = $3,
+             updated_at = GREATEST(updated_at, $4)
+       WHERE id = $5 AND user_id = $6 AND deleted_at IS NULL
+         AND jsonb_array_length(messages) = $7
+         AND jsonb_array_length(messages) + $8 <= 1000
+       RETURNING jsonb_array_length(messages) AS n`,
+      [JSON.stringify(newMessages), title, isPinned, updatedAt, id, userId, baseCount, newMessages.length]
+    );
+    if (upd.rows[0]) return res.json({ ok: true, count: Number(upd.rows[0].n) });
+
+    // 2) Update didn't go through: chat is new, trashed, or the server count differs
+    const cur = await pool!.query(
+      'SELECT jsonb_array_length(messages) AS n, deleted_at FROM chats WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    const row = cur.rows[0];
+
+    if (!row) {
+      if (baseCount !== 0) {
+        return res.status(409).json({ error: 'Server copy alag hai.', serverCount: 0 });
+      }
+      const ins = await pool!.query(
+        `INSERT INTO chats (id, user_id, title, is_pinned, created_at, updated_at, messages)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+         ON CONFLICT (id, user_id) DO NOTHING
+         RETURNING id`,
+        [id, userId, title, isPinned, createdAt, updatedAt, JSON.stringify(newMessages)]
+      );
+      if (ins.rows[0]) return res.status(201).json({ ok: true, count: newMessages.length });
+      return res.status(409).json({ error: 'Server copy alag hai.', serverCount: -1 }); // race
+    }
+
+    if (row.deleted_at !== null && row.deleted_at !== undefined) {
+      return res.json({ ok: true, skipped: 'trashed', count: Number(row.n) });
+    }
+    return res.status(409).json({ error: 'Server copy alag hai.', serverCount: Number(row.n) });
+  } catch (err) {
+    console.error('append chat error:', err);
+    res.status(500).json({ error: 'Chat save nahi ho payi.' });
+  }
+});
+
 // DELETE /chats/:id → move to trash. Share link revoked immediately.
 router.delete('/chats/:id', requireConfigured, requireAuth, async (req: Request, res: Response) => {
   try {
